@@ -108,6 +108,35 @@ end
     end
 end
 
+@testset "buffered adjoint sweeps agree with the generic ones: $T" for T in (Float64, Float32)
+    # The packed adjoint sweeps `_lhl_z(inv)sweepH_buf!` must match the width-agnostic
+    # generic `_lhl_z(inv)sweepH!` on every ISA.  The descending back substitution folds
+    # a group's four coupling rows from registers as if they were the first SIMD vector,
+    # which only holds when a vector spans ≥ 4 lanes; on a 128-bit target `Float64` has 2,
+    # so this guards that width < 4 path.  Sizes cross G = 0/1/≥2 groups and the tiling
+    # limit (725 Float64 / 1030 both above 2 MiB).
+    LHL = LHLFactorization
+    for n in (1, 2, 3, 5, 6, 9, 10, 13, 40, 129, 331, 725, 1030)
+        J = randn(MersenneTwister(n), T, n, n)
+        b = randn(MersenneTwister(n + 5), T, n)
+        ws = lhl(J)
+        Lp = ws.Lp
+        for (gen!, buf!) in (
+                (LHL._lhl_zsweepH!, LHL._lhl_zsweepH_buf!),
+                (LHL._lhl_zinvsweepH!, LHL._lhl_zinvsweepH_buf!),
+            )
+            g = copy(b)
+            gen!(g, Lp, n)
+            y = zeros(T, n + 2 * LHL._lhl_tilew(T))
+            copyto!(view(y, 1:n), b)
+            buf!(y, 0, Lp, n)
+            # the two differ only in summation order (SIMD tree vs sequential), O(n)·eps;
+            # the width < 4 fold bug this guards against was instead O(1)
+            @test view(y, 1:n) ≈ g rtol = 200 * n * eps(T)
+        end
+    end
+end
+
 @testset "explicit-vector solve kernels agree with the generic ones" begin
     # 725 (Float64) and 1030 (both) put the packed multipliers above the 2 MiB tiling limit
     for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
