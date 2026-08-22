@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+  - **Adjoint solves from the existing reduction**: `lhl_ldivH!` solves `Wᴴ x = b`
+    against the same reduction and the same shift LU as `lhl_ldiv!`
+    (`Wᴴ = Z⁻ᴴ Gᴴ Zᴴ` — three `O(n²)` phases, no refactorization), with `lhl_refineH!`
+    for iterative refinement against `Aᴴ` and `applyZH!`/`applyZinvH!` for the adjoint
+    similarity transformations. A complex shift on a real reduction conjugates only the
+    shifted half: `Zᴴ = Zᵀ` stays real.
   - **Explicit-vector kernels for fully complex workspaces** (`lhl(J::Matrix{ComplexF64})`
     and `ComplexF32`). The reduction's trailing update, trailing GEMM and panel GEMV now
     run real explicit-vector kernels on the interleaved storage, and the solves' Z sweeps
@@ -10,7 +18,6 @@
     is 4) instead of 6.4–7.5×, and `lhl_ldiv!` at ≈2.5× instead of ≈4.7×. The threaded
     reduction now covers `ComplexF64` (`n ≥ 512`) and `ComplexF32` (`n ≥ 1024`), and is
     still bit-identical for any thread count. The `factors` layout is unchanged.
-
   - **Complex pivot magnitudes and balance norms are now `|re| + |im|`** (LAPACK's
     `CABS1`, as the shifted LU already used), replacing `abs`. Pivot *choices* of a
     complex reduction can therefore differ from v2.0.0 in near-ties; results differ at
