@@ -9,26 +9,34 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [weakdeps]
 Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
+PureKLU = "0c0d3e7f-3a8b-4f7e-b6f1-9a4d2e7c1f01"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [extensions]
 LHLFactorizationPolyesterExt = "Polyester"
+LHLFactorizationSparseExt = ["PureKLU", "SparseArrays"]
 
 [compat]
 LinearAlgebra = "1.10"
 PrecompileTools = "1.2"
 Polyester = "0.7"
+PureKLU = "1.4"
 Random = "1"
 SafeTestsets = "0.1"
 SciMLTesting = "2.4"
+SparseArrays = "1.10"
 Test = "1"
 julia = "1.10"
 
 [extras]
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
+PureKLU = "0c0d3e7f-3a8b-4f7e-b6f1-9a4d2e7c1f01"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SafeTestsets = "1bc83da4-3b8d-516f-aca4-4fe02f6d838f"
 SciMLTesting = "09d9d899-5365-40a9-917a-5f67fddea283"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Random", "SafeTestsets", "SciMLTesting", "Polyester"]
+test = ["Test", "Random", "SafeTestsets", "SciMLTesting", "Polyester", "PureKLU", "SparseArrays"]
