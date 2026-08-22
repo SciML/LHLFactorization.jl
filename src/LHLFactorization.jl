@@ -3221,9 +3221,10 @@ end
 # The adjoint sweeps on the padded buffer: full vectors past `n` (both pads zero), one
 # plane at a time.  The planar complex path runs each plane through these — the
 # multipliers are real, so no conjugation and no cross-plane terms.
-function _lhl_zsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+_lhl_zsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}} =
+    _lhl_zsweepH_buf!(Val(_lhl_tilew(T)), y, o, Lp, n)
+function _lhl_zsweepH_buf!(::Val{W}, y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {W, T <: Union{Float32, Float64}}
+    V = NTuple{W, VecElement{T}}
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -3274,17 +3275,20 @@ end
     return x1, x2, x3, x4
 end
 
-# One column's slice of a pipelined dot's first vector: rows k+1:k+4 from the registers
-# the head just produced, rows k+5:k+W (W = 8 only) from memory.
-@inline function _lhl_zfoldH(pc::Ptr{T}, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}, W::Int) where {T}
-    s = muladd(
-        unsafe_load(pc), x1, muladd(
-            unsafe_load(pc, 2), x2,
-            muladd(unsafe_load(pc, 3), x3, unsafe_load(pc, 4) * x4)
-        )
-    )
-    for r in 5:W
-        s = muladd(unsafe_load(pc, r), unsafe_load(py4, r - 4), s)
+# One column's slice of the rows a pipelined dot left out: its first `NV` vectors
+# (`NV = max(1, 4 ÷ W)`, so 4 rows for W ≤ 4 and W rows above), rows k+1:k+4 from the
+# registers the head just produced, the rest (W = 8, 16) from memory.  Row r of the slice
+# sits at `pc + (r - 1) ÷ W · pa + (r - 1) % W` elements — consecutive for one vector, `pa`
+# apart across vectors.
+@inline function _lhl_zfoldH(
+        ::Val{W}, pc::Ptr{T}, pa::Int, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}
+    ) where {W, T}
+    NV = max(1, 4 ÷ W)
+    s = zero(T)
+    for r in 1:(NV * W)
+        c = unsafe_load(pc + ((r - 1) ÷ W) * pa, (r - 1) % W + 1)
+        x = r == 1 ? x1 : r == 2 ? x2 : r == 3 ? x3 : r == 4 ? x4 : unsafe_load(py4, r - 4)
+        s = muladd(c, x, s)
     end
     return s
 end
@@ -3292,25 +3296,15 @@ end
 # The descending sweep is a back substitution: each group's dots read the four rows the
 # previous head wrote, so the groups chain.  Pipelined like `_hessenberg_solve_buf!`: the
 # next group's dots over the rows no pending head touches (its body minus its first
-# vector) are issued before the current head's scalar chain, and the first vector is
-# folded in afterwards from registers.
-function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    if W < 4
-        # This descending back substitution is pipelined: the next group's body dots are
-        # issued before the current group's head is resolved, and the four rows that head
-        # writes (the intra-group coupling) are folded back in from registers afterwards
-        # (`_lhl_zfoldH`).  That fold treats the four coupling rows as the first SIMD
-        # vector, so it is only correct when a vector spans at least them — `W ≥ 4`.  On a
-        # 128-bit ISA `W = 2` for `Float64`, so those four rows straddle two vectors: the
-        # second is already summed into the body dots and the fold would count it again.
-        # The generic sweep is width agnostic, so defer to it there.  (`Float32` keeps
-        # `W = 4` even at 128 bits, and every 256-bit target has `W ≥ 4`, so the fast path
-        # below still runs for them.)
-        _lhl_zinvsweepH!(view(y, (o + 1):length(y)), Lp, n)
-        return y
-    end
+# `NV` vectors, the ones holding rows k+1:k+4) are issued before the current head's scalar
+# chain, and those vectors are folded in afterwards from registers (`_lhl_zfoldH`).
+# `W` is the vector width `Lp` was packed with (`_lhl_tilew(T)` in the workspace); the
+# `Val` form exists so that the tests can run every width on any machine.
+_lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}} =
+    _lhl_zinvsweepH_buf!(Val(_lhl_tilew(T)), y, o, Lp, n)
+function _lhl_zinvsweepH_buf!(::Val{W}, y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {W, T <: Union{Float32, Float64}}
+    V = NTuple{W, VecElement{T}}
+    NV = max(1, 4 ÷ W)
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -3341,14 +3335,14 @@ function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where
             csn = tiled ? W * sz : mpbn
             pan = tiled ? 4W * sz : W * sz
             e1, e2, e3, e4 = _lhl_zbodyH(
-                V, pf + pan, tiled ? pf + 4mpbn : pf + mpbn, pan, csn, py + (k + 4 + W) * sz
+                V, pf + NV * pan, tiled ? pf + 4mpbn : pf + mpbn, pan, csn, py + (k + 4 + NV * W) * sz
             )
             x1, x2, x3, x4 = _lhl_zinvheadH(y, o, k + 4, h, d1, d2, d3, d4)
             py4 = py + (k + 8) * sz
-            d1 = e1 + _lhl_zfoldH(pf, x1, x2, x3, x4, py4, W)
-            d2 = e2 + _lhl_zfoldH(pf + csn, x1, x2, x3, x4, py4, W)
-            d3 = e3 + _lhl_zfoldH(pf + 2csn, x1, x2, x3, x4, py4, W)
-            d4 = e4 + _lhl_zfoldH(pf + 3csn, x1, x2, x3, x4, py4, W)
+            d1 = e1 + _lhl_zfoldH(Val(W), pf, pan, x1, x2, x3, x4, py4)
+            d2 = e2 + _lhl_zfoldH(Val(W), pf + csn, pan, x1, x2, x3, x4, py4)
+            d3 = e3 + _lhl_zfoldH(Val(W), pf + 2csn, pan, x1, x2, x3, x4, py4)
+            d4 = e4 + _lhl_zfoldH(Val(W), pf + 3csn, pan, x1, x2, x3, x4, py4)
             h = hn
             g -= 1
         end

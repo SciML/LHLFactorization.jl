@@ -137,6 +137,35 @@ end
     end
 end
 
+@testset "explicit adjoint sweeps agree across vector widths: $T" for T in (Float64, Float32)
+    # The descending adjoint sweep pipelines each group's dot around the previous head and
+    # folds the four rows that head produces in from registers; how many vectors those rows
+    # span depends on the width (16 B on aarch64, 32 B on x86-64), so every width is run
+    # here on every machine, against the workspace's own width.
+    LHL = LHLFactorization
+    W0 = LHL._lhl_tilew(T)
+    pad = 16
+    sweep(f, W, Lp, v, n) = f(Val(W), vcat(v, zeros(T, pad)), 0, Lp, n)[1:n]
+    for n in (5, 12, 13, 21, 40, 129, 256, 725, 1030)
+        J = randn(MersenneTwister(n), T, n, n)
+        ws = lhl(J)
+        v = randn(MersenneTwister(n + 3), T, n)
+        up0 = sweep(LHL._lhl_zsweepH_buf!, W0, ws.Lp, v, n)
+        dn0 = sweep(LHL._lhl_zinvsweepH_buf!, W0, ws.Lp, v, n)
+        rt = 20 * n * eps(T)   # measured differences are below 0.15 n·eps
+        for W in (2, 4, 8, 16)
+            Lp = Vector{T}(undef, LHL._lhl_lpack_len(n, W))
+            LHL._lhl_lpack!(Lp, ws.factors, n, Val(W))
+            @test sweep(LHL._lhl_zsweepH_buf!, W, Lp, v, n) ≈ up0 rtol = rt
+            dn = sweep(LHL._lhl_zinvsweepH_buf!, W, Lp, v, n)
+            # the inverse sweeps differ by rounding order amplified by κ(L); the round trip
+            # through the forward sweep removes the amplification of the reference
+            @test sweep(LHL._lhl_zsweepH_buf!, W0, ws.Lp, dn, n) ≈ v rtol = rt
+            @test dn ≈ dn0 rtol = rt
+        end
+    end
+end
+
 @testset "explicit-vector solve kernels agree with the generic ones" begin
     # 725 (Float64) and 1030 (both) put the packed multipliers above the 2 MiB tiling limit
     for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
