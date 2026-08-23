@@ -4155,7 +4155,19 @@ function _hessenberg_solve_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Un
     return y
 end
 
-@inline _lhl_vsum(v::_LHLVec{T, W}) where {T, W} = sum(ntuple(w -> v[w].value, Val(W + 1)))
+# Lane sum as a pairwise tree (halves added until one lane): LLVM lowers it to `ext`/`fadd`/
+# `faddp` — 6 instructions, 4 deep, for 8 lanes — where the sequential sum is 12 instructions
+# on a 7-deep chain.  The sum sits on the serial chain of the pipelined adjoint sweep
+# (`_lhl_zinvsweepH_buf!`): with 8-lane Float32 vectors on NEON that sweep measured 0.81× of
+# the 4-lane one sequential and 0.87–0.93× with the tree.
+# (`Tuple{T, T, Vararg{T, N}}` rather than `NTuple{N, T}`, which leaves `T` unbound for
+# the empty tuple — Aqua's unbound-parameter check.)
+@inline _lhl_vsum_tree(t::Tuple{T}) where {T} = t[1]
+@inline function _lhl_vsum_tree(t::Tuple{T, T, Vararg{T, N}}) where {T, N}
+    h = (N + 2) >> 1
+    return _lhl_vsum_tree(ntuple(i -> t[i] + t[i + h], Val(h)))
+end
+@inline _lhl_vsum(v::_LHLVec{T, W}) where {T, W} = _lhl_vsum_tree(ntuple(w -> v[w].value, Val(W + 1)))
 
 # The adjoint Hessenberg solve, on the same `Gt`/`rdiag`/`swap` the forward one consumes.
 # The forward elimination gives G⁻¹ = U⁻¹·Eₙ₋₁Sₙ₋₁⋯E₁S₁ (Sₖ the step-k interchange, Eₖ the
