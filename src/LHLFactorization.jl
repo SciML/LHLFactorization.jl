@@ -243,22 +243,33 @@ end
 # columns a row block sweeps; m ≤ 8 covered the EPYC 7502, Apple M2 Max still dips 7–20 %
 # at n ≡ 32 (mod 64) until m ≤ 16 — the wider range pads a few more n by ≤ 16 columns and
 # never more than the m ≤ 8 rule's worst case).  Below n = 64 the aliasing costs nothing
-# measurable.
+# measurable.  The margin of a candidate repeats with period 4096 ÷ gcd(W·sz, 4096) steps
+# of W, so that is the whole search; the first candidate clearing the margin for every m
+# wins, else the widest margin — element sizes of 256 bytes and up cannot clear it for
+# m = 16 at all, and the search must still end.
 function _lhl_ld(n::Int, ::Type{T}) where {T}
     n <= 64 && return n
     sz = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Cvoid})
+    sz == 0 && return n           # nothing stored, nothing to alias
     W = max(32 ÷ sz, 1)
-    ld = W * cld(n, W) - W
-    ok = false
-    while !ok
-        ld += W
-        ok = true
+    ld0 = W * cld(n, W)
+    period = 4096 ÷ gcd(W * sz, 4096)
+    best = ld0
+    bestd = -1
+    for j in 0:(period - 1)
+        ld = ld0 + j * W
+        d = 4096
         for m in 1:16
             r = (m * ld * sz) % 4096
-            ok &= min(r, 4096 - r) >= 128
+            d = min(d, r, 4096 - r)
+        end
+        d >= 128 && return ld
+        if d > bestd
+            best = ld
+            bestd = d
         end
     end
-    return ld
+    return best
 end
 
 _lhl_lpp_len(n::Int, ::Type{T}) where {T} =
@@ -3294,14 +3305,14 @@ end
 end
 
 # One column's slice of the rows a pipelined dot left out: its first `NV` vectors
-# (`NV = max(1, 4 ÷ W)`, so 4 rows for W ≤ 4 and W rows above), rows k+1:k+4 from the
+# (`NV = cld(4, W)`, so 4 rows for W ≤ 4 and W rows above), rows k+1:k+4 from the
 # registers the head just produced, the rest (W = 8, 16) from memory.  Row r of the slice
 # sits at `pc + (r - 1) ÷ W · pa + (r - 1) % W` elements — consecutive for one vector, `pa`
 # apart across vectors.
 @inline function _lhl_zfoldH(
         ::Val{W}, pc::Ptr{T}, pa::Int, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}
     ) where {W, T}
-    NV = max(1, 4 ÷ W)
+    NV = cld(4, W)
     s = zero(T)
     for r in 1:(NV * W)
         c = unsafe_load(pc + ((r - 1) ÷ W) * pa, (r - 1) % W + 1)
@@ -3322,7 +3333,7 @@ _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Un
     _lhl_zinvsweepH_buf!(Val(_lhl_tilew(T)), y, o, Lp, n)
 function _lhl_zinvsweepH_buf!(::Val{W}, y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {W, T <: Union{Float32, Float64}}
     V = NTuple{W, VecElement{T}}
-    NV = max(1, 4 ÷ W)
+    NV = cld(4, W)
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2

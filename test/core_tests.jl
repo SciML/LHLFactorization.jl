@@ -166,6 +166,33 @@ end
     end
 end
 
+@testset "leading dimension of fstore" begin
+    # the padding rule: 32-byte aligned columns, no m ≤ 16 multiple of the stride within
+    # 128 bytes of a 4 KiB multiple, never more than a few columns of padding — and the search
+    # must end for every element size (256-byte elements cannot satisfy the m = 16 clause at
+    # all; zero-size elements must not divide by zero)
+    LHL = LHLFactorization
+    for T in (Float64, Float32, ComplexF64, ComplexF32, Float16), n in (1, 64, 65, 66, 100, 249, 256, 499, 500, 512, 1000, 1024, 1030, 2048, 4097)
+        ld = LHL._lhl_ld(n, T)
+        @test ld >= n
+        n <= 64 && (@test ld == n; continue)
+        sz = sizeof(T)
+        @test (ld * sz) % 32 == 0
+        @test (ld - n) * sz < 256          # worst cases 31/63/15/127 columns for 8/4/16/2-byte elements
+        for m in 1:16
+            r = (m * ld * sz) % 4096
+            @test min(r, 4096 - r) >= 128
+        end
+    end
+    t = @elapsed for n in (65, 300, 1024)
+        @test LHL._lhl_ld(n, NTuple{32, Float64}) >= n      # 256-byte elements
+        @test LHL._lhl_ld(n, NTuple{5, Float64}) >= n       # 40-byte elements
+        @test LHL._lhl_ld(n, Nothing) == n                  # sizeof 0
+        @test LHL._lhl_ld(n, BigFloat) >= n                 # not isbits: pointer size
+    end
+    @test t < 5
+end
+
 @testset "explicit-vector solve kernels agree with the generic ones" begin
     # 725 (Float64) and 1030 (both) put the packed multipliers above the x86-64 tiling limit
     for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
