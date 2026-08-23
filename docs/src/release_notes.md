@@ -4,6 +4,20 @@
 
 ### Added
 
+  - **Sparse `J`** (extension, loaded with `SparseArrays` and
+    [PureKLU](https://github.com/SciML/PureKLU.jl)): `lhl(J::SparseMatrixCSC)` solves the
+    shifted family `(σI + τJ)x = b` for a sparse Jacobian. A Hessenberg similarity fills in
+    an irreducible sparse block, so the only sparsity the reduction can exploit is
+    reducibility: the extension takes the symmetric block triangular form (strongly
+    connected components — the BTF of `σI + τJ`, with a symmetric permutation a similarity
+    needs), reduces each irreducible diagonal block with this package's dense kernels or,
+    where a per-block cost model finds it cheaper, a PureKLU sparse LU refactored per shift,
+    and keeps the off-diagonal blocks sparse. The same verbs work on the returned
+    factorization (`lhl_shift!`, `lhl_ldiv!`, `lhl_refine!`, `lhl!`, `ldiv!`, `\`, a matrix
+    right-hand side); `shift = Complex{eltype(J)}` gives complex shifts on a real reduction
+    and `thread = true` threads the shift and reduction over blocks. It wins on
+    block-triangular, dense-block or high-fill Jacobians and defers to a sparse LU
+    elsewhere.
   - **Adjoint solves from the existing reduction**: `lhl_ldivH!` solves `Wᴴ x = b`
     against the same reduction and the same shift LU as `lhl_ldiv!`
     (`Wᴴ = Z⁻ᴴ Gᴴ Zᴴ` — three `O(n²)` phases, no refactorization), with `lhl_refineH!`

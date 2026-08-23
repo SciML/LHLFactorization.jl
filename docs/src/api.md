@@ -44,3 +44,13 @@ applyZinv!
 applyZH!
 applyZinvH!
 ```
+
+## Sparse routing
+
+Predicates a consumer (for example a linear-solver stack) can use to decide when
+the sparse `J` path — the `SparseArrays` + `PureKLU` extension — is worth taking.
+
+```@docs
+lhl_isreduced
+lhl_prefers_sparse
+```
