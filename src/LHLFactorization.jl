@@ -3296,6 +3296,20 @@ end
 function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
+    if W < 4
+        # This descending back substitution is pipelined: the next group's body dots are
+        # issued before the current group's head is resolved, and the four rows that head
+        # writes (the intra-group coupling) are folded back in from registers afterwards
+        # (`_lhl_zfoldH`).  That fold treats the four coupling rows as the first SIMD
+        # vector, so it is only correct when a vector spans at least them — `W ≥ 4`.  On a
+        # 128-bit ISA `W = 2` for `Float64`, so those four rows straddle two vectors: the
+        # second is already summed into the body dots and the fold would count it again.
+        # The generic sweep is width agnostic, so defer to it there.  (`Float32` keeps
+        # `W = 4` even at 128 bits, and every 256-bit target has `W ≥ 4`, so the fast path
+        # below still runs for them.)
+        _lhl_zinvsweepH!(view(y, (o + 1):length(y)), Lp, n)
+        return y
+    end
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2

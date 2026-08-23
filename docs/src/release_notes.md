@@ -25,6 +25,21 @@
     multipliers are now bounded by `√2` in modulus (LAPACK's own bound for `zgetrf`)
     rather than 1. Real workspaces are bit-for-bit unaffected.
 
+### Fixed
+
+  - **`lhl_ldivH!` (and the `applyZinvH!` it drives) gave wrong `Float64` adjoint
+    solves on 128-bit-SIMD targets** (e.g. AArch64/NEON, where a `Float64` vector holds
+    two lanes). The packed back-substitution `_lhl_zinvsweepH_buf!` is pipelined: it
+    issues the next group's body dot products before the current group's head is
+    resolved, then folds the four intra-group coupling rows back in from registers. That
+    fold treated the four rows as the first SIMD vector, which is only true when a vector
+    spans at least four lanes; with two lanes the four rows straddle two vectors, so the
+    second was counted twice and the solve was off by `O(1)`. The forward solve,
+    `applyZH!`, the adjoint Hessenberg solve, and every `Float32` path (four lanes even
+    at 128 bits) were already correct, as was every 256-bit target. The kernel now falls
+    back to the width-agnostic generic sweep when a vector holds fewer than four lanes,
+    and stays non-allocating. This landed before any release contained the adjoint API.
+
 ## v2.0
 
 Breaking. The changes below are mechanical to adopt; `lhl`, `lhl!`, `lhl_reduce!`,
