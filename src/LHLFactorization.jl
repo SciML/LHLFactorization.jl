@@ -65,6 +65,27 @@ const _LHL_CFloat = Union{ComplexF32, ComplexF64}
 # targets take the NEON values.
 const _LHL_X86 = Sys.ARCH === :x86_64
 
+# Bytes per kernel vector, two of them: `_LHL_RVEC_BYTES` is what the reduction kernels
+# (GEMM microkernel, row-block trailing update, panel GEMVs) are written for, `_LHL_SVEC_BYTES`
+# what the `Lp` tiles, the solve sweeps and the Hessenberg solves use.  32 is one AVX2
+# register; on 16-byte NEON LLVM legalizes it to two registers per vector, which with 32
+# vector registers doubles every tile for free (Apple M2 Max: reduction 5–17 % faster at
+# n ≤ 192 and 3–6 % above, solves 7–17 % faster at n ≤ 128 than with 16; 64 was 20–47 %
+# slower).  On AVX-512 (EPYC 9354, Zen 4) the reduction wants 64 — the row-block sweep is
+# 10–40 % faster at n = 32–768 and stays ahead of the blocked path to n ≈ 1000–2000 — while
+# the solve sweeps want 32 (64 is 10–35 % slower at n ≤ 256 for Float32 ldiv/ldivH,
+# 5–17 % for Float64, the dot-product kernels' per-group overhead).  Hence the split.
+# AVX-512 is taken from the host CPU name (`Sys.CPU_NAME`); precompiled images carry the
+# width of the machine that built them (their kernels are compiled for it as well).
+const _LHL_AVX512_CPUS = (
+    "znver4", "znver5", "skylake-avx512", "cascadelake", "cooperlake", "cannonlake",
+    "icelake-client", "icelake-server", "tigerlake", "rocketlake", "sapphirerapids",
+    "emeraldrapids", "graniterapids", "knl", "knm",
+)
+const _LHL_AVX512 = Sys.ARCH === :x86_64 && Sys.CPU_NAME in _LHL_AVX512_CPUS
+const _LHL_RVEC_BYTES = _LHL_AVX512 ? 64 : 32
+const _LHL_SVEC_BYTES = 32
+
 """
     LHLShift{TG}(n)
     LHLShift{TG}(ws::LHLWorkspace)
@@ -208,7 +229,7 @@ Base.propertynames(::LHLWorkspace) = (fieldnames(LHLWorkspace)..., _LHL_SHIFT_FI
 
 # Rows per tile of the packed multipliers and of the buffer padding: one vector register
 # for the explicit kernels, a fixed 8 for the generic sweeps.
-_lhl_tilew(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _LHL_VEC_BYTES ÷ sizeof(T) : 8
+_lhl_tilew(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _LHL_SVEC_BYTES ÷ sizeof(T) : 8
 
 # Layout of `Lp` (multipliers of steps 1:n-2, rows k+2:n of step k).  Steps come in groups of
 # four, k = 4g-3, g = 1:(n-2)÷4: eight head slots holding the 3×3 triangle rows k+2:k+4 in
@@ -238,7 +259,8 @@ function _lhl_lpack_len(n::Int, W::Int)
     return len
 end
 
-# Leading dimension of `fstore`: columns 32-byte aligned, and no multiple m ≤ 16 of the
+# Leading dimension of `fstore`: columns aligned to the reduction vector (32 bytes; 64 on
+# AVX-512, where 32-byte-aligned zmm columns cost 5–7 %), and no multiple m ≤ 16 of the
 # column stride within 128 bytes of a multiple of 4 KiB (store→load aliasing between the
 # columns a row block sweeps; m ≤ 8 covered the EPYC 7502, Apple M2 Max still dips 7–20 %
 # at n ≡ 32 (mod 64) until m ≤ 16 — the wider range pads a few more n by ≤ 16 columns and
@@ -251,7 +273,7 @@ function _lhl_ld(n::Int, ::Type{T}) where {T}
     n <= 64 && return n
     sz = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Cvoid})
     sz == 0 && return n           # nothing stored, nothing to alias
-    W = max(32 ÷ sz, 1)
+    W = max(_LHL_RVEC_BYTES ÷ sz, 1)
     ld0 = W * cld(n, W)
     period = 4096 ÷ gcd(W * sz, 4096)
     best = ld0
@@ -653,9 +675,15 @@ end
 # the left update first.  Blocks are 4 vectors of W rows; the block straddling row k+1 and
 # the last < W rows (a vector overlapping already-finished rows) go through the masked
 # single-vector kernel, whose lanes select between the updated and the untouched value.
+# The kernel needs one full vector of rows; below that the 32-byte vector (the only one
+# on AVX2 / NEON) still covers n ≥ 8, and the generic paired sweep takes the rest.
 function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    n >= _LHL_RVEC_BYTES ÷ sizeof(T) && return _lhl_trailing_update!(_lhl_rvectype(T), A, k, n)
+    return _lhl_trailing_update!(_lhl_svectype(T), A, k, n)
+end
+function _lhl_trailing_update!(
+        ::Type{V}, A::StridedMatrix{T}, k::Int, n::Int
+    ) where {W, T <: Union{Float32, Float64}, V <: NTuple{W, VecElement{T}}}
     (n < max(W, 8) || stride(A, 1) != 1) &&
         return invoke(_lhl_trailing_update!, Tuple{AbstractMatrix, Int, Int}, A, k, n)
     GC.@preserve A begin
@@ -805,8 +833,13 @@ end
 
 function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: _LHL_CFloat}
     Tr = real(T)
-    V = _lhl_vectype(Tr)
-    W = _LHL_VEC_BYTES ÷ sizeof(Tr)
+    n >= _LHL_RVEC_BYTES ÷ sizeof(Tr) && return _lhl_trailing_update!(_lhl_rvectype(Tr), A, k, n)
+    return _lhl_trailing_update!(_lhl_svectype(Tr), A, k, n)
+end
+function _lhl_trailing_update!(
+        ::Type{V}, A::StridedMatrix{T}, k::Int, n::Int
+    ) where {W1, Tr, T <: _LHL_CFloat, V <: _LHLVec{Tr, W1}}   # `_LHLVec` pins `Tr` (Aqua)
+    W = W1 + 1
     Wc = W >> 1
     (n < max(W, 8) || stride(A, 1) != 1) &&
         return invoke(_lhl_trailing_update!, Tuple{AbstractMatrix, Int, Int}, A, k, n)
@@ -962,12 +995,15 @@ end
 # AVX2 (EPYC 7502); with the explicit complex kernels the measured crossovers sit at
 # n ≈ 500 (ComplexF64) and 1024–1400 (ComplexF32) there.  On 16-byte NEON (Apple M2 Max,
 # kernels at two registers per vector) the crossovers measure ≈ 500 / 576 / 768 / 1152 —
-# the row-block sweep is relatively weaker for Float32, stronger for complex.  Other
-# non-x86 targets are unmeasured and take the NEON values.
-_lhl_block_min(::Type{Float64}) = 500
-_lhl_block_min(::Type{Float32}) = _LHL_X86 ? 1024 : 576
-_lhl_block_min(::Type{ComplexF64}) = _LHL_X86 ? 512 : 768
-_lhl_block_min(::Type{ComplexF32}) = _LHL_X86 ? 1024 : 1152
+# the row-block sweep is relatively weaker for Float32, stronger for complex.  With the
+# 64-byte reduction kernels on AVX-512 (EPYC 9354) the row-block sweep stays ahead much
+# longer, to ≈ 1320 / 1900 / 1140 / 1700, and falls off steeply past that (it is then
+# out of L2), so the constants sit a little below.  Other non-x86 targets are unmeasured
+# and take the NEON values.
+_lhl_block_min(::Type{Float64}) = _LHL_AVX512 ? 1280 : 500
+_lhl_block_min(::Type{Float32}) = _LHL_AVX512 ? 1920 : _LHL_X86 ? 1024 : 576
+_lhl_block_min(::Type{ComplexF64}) = _LHL_AVX512 ? 1152 : _LHL_X86 ? 512 : 768
+_lhl_block_min(::Type{ComplexF32}) = _LHL_AVX512 ? 1664 : _LHL_X86 ? 1024 : 1152
 _lhl_block_min(::Type{T}) where {T} = 768
 _lhl_panel_width(n::Int) = 16
 
@@ -1823,8 +1859,8 @@ end
 # at a time so that the P loads of a row are in flight together (the partials sit in other
 # cores' caches).
 @inline function _lhl_sum_partials!(pw::Ptr{T}, pP::Ptr{T}, ldp::Int, P::Int, ia::Int, ib::Int) where {T}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_rvectype(T)
+    W = _LHL_RVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     lps = ldp * sz
     i = ia
@@ -1910,8 +1946,8 @@ end
 @inline function _lhl_cgemv_group!(
         pq::Ptr{T}, pA::Ptr{T}, ld::Int, k::Int, r0::Int, r1::Int, ca::Int, cb::Int
     ) where {T}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_rvectype(T)
+    W = _LHL_RVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     lds = ld * sz
     pk = pA + (k - 1) * lds
@@ -2053,7 +2089,7 @@ function _lhl_top_gemm!(
     if stride(A, 1) != 1
         return invoke(_lhl_top_gemm!, Tuple{Any, AbstractMatrix{T}, Int, Int, Int, Any, Int}, bk, A, k0, kb, nb, pack, nt)
     end
-    mr = 3 * (_LHL_VEC_BYTES ÷ sizeof(T))
+    mr = 3 * (_LHL_RVEC_BYTES ÷ sizeof(T))
     ld = stride(A, 2)
     GC.@preserve A begin
         pA = pointer(A)
@@ -2070,8 +2106,8 @@ function _lhl_top_gemm!(
 end
 
 @inline function _lhl_top_gemm_rows!(pA::Ptr{T}, ld::Int, k0::Int, kb::Int, n::Int, ia::Int, ie0::Int) where {T}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_rvectype(T)
+    W = _LHL_RVEC_BYTES ÷ sizeof(T)
     mr = 3W
     rowblock = 4mr
     sz = sizeof(T)
@@ -2146,21 +2182,14 @@ end
 # K loop; P (the multiplier panel) is packed with the sign folded in so the tile streams it
 # with unit stride and no leading-dimension aliasing.
 # ---------------------------------------------------------------------------
-# Bytes per kernel vector: the width the explicit-vector kernels (GEMM microkernel, row-block
-# trailing update, `Lp` tiles and solve sweeps) are written for.  32 is one AVX2 register;
-# on 16-byte NEON LLVM legalizes it to two registers per vector, which with 32 vector
-# registers doubles every tile for free (Apple M2 Max: reduction 5–17 % faster at n ≤ 192
-# and 3–6 % above, solves 7–17 % faster at n ≤ 128 than with 16; 64 was 20–47 % slower).
-# Not measured on AVX-512, where 64 would be the natural value.
-const _LHL_VEC_BYTES = 32
-
 for (T, sfx) in ((Float64, "f64"), (Float32, "f32")), W in (2, 4, 8, 16)
     V = NTuple{W, VecElement{T}}
     @eval @inline _lhl_fma(a::$V, b::$V, c::$V) = ccall(
         $("llvm.fmuladd.v$(W)$(sfx)"), llvmcall, $V, ($V, $V, $V), a, b, c
     )
 end
-@inline _lhl_vectype(::Type{T}) where {T} = NTuple{_LHL_VEC_BYTES ÷ sizeof(T), VecElement{T}}
+@inline _lhl_rvectype(::Type{T}) where {T} = NTuple{_LHL_RVEC_BYTES ÷ sizeof(T), VecElement{T}}
+@inline _lhl_svectype(::Type{T}) where {T} = NTuple{_LHL_SVEC_BYTES ÷ sizeof(T), VecElement{T}}
 @inline _lhl_vload(::Type{V}, p::Ptr) where {V} = unsafe_load(Ptr{V}(p))
 @inline _lhl_vstore!(p::Ptr, v::V) where {V} = unsafe_store!(Ptr{V}(p), v)
 @inline _lhl_bcast(::Type{NTuple{W, VecElement{T}}}, x::T) where {W, T} =
@@ -2336,8 +2365,8 @@ end
         pA::Ptr{T}, ld::Int, pP::Ptr{T}, ldp::Int, pB::Ptr{T}, K::Int, i0::Int, i1::Int,
         c0::Int, c1::Int
     ) where {T}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_rvectype(T)
+    W = _LHL_RVEC_BYTES ÷ sizeof(T)
     mr = 3W
     rowblock = 384
     ib = i0
@@ -2488,8 +2517,8 @@ end
 @inline function _lhl_trsm_cols!(
         pA::Ptr{T}, ld::Int, pP::Ptr{T}, pB::Ptr{T}, nb::Int, k0::Int, kb::Int, ca::Int, cb::Int
     ) where {T}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_rvectype(T)
+    W = _LHL_RVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     for c in ca:cb
         pc = pA + (c - 1) * ld * sz
@@ -2987,8 +3016,8 @@ for P in (1, 2)
     o1 = os[1]
     @eval begin
         function _lhl_zinvsweep_buf!(y::Vector{T}, $(args...), Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-            V = _lhl_vectype(T)
-            W = _LHL_VEC_BYTES ÷ sizeof(T)
+            V = _lhl_svectype(T)
+            W = _LHL_SVEC_BYTES ÷ sizeof(T)
             sz = sizeof(T)
             tiled = _lhl_tiled(n, T)
             G = max(n - 2, 0) >> 2
@@ -3022,8 +3051,8 @@ for P in (1, 2)
         end
 
         function _lhl_zsweep_buf!(y::Vector{T}, $(args...), Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-            V = _lhl_vectype(T)
-            W = _LHL_VEC_BYTES ÷ sizeof(T)
+            V = _lhl_svectype(T)
+            W = _LHL_SVEC_BYTES ÷ sizeof(T)
             sz = sizeof(T)
             tiled = _lhl_tiled(n, T)
             G = max(n - 2, 0) >> 2
@@ -3491,8 +3520,8 @@ end
 end
 
 function _lhl_zinvsweep_bufc!(y::Vector{T}, oa::Int, ob::Int, Lpp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -3526,8 +3555,8 @@ function _lhl_zinvsweep_bufc!(y::Vector{T}, oa::Int, ob::Int, Lpp::Vector{T}, n:
 end
 
 function _lhl_zsweep_bufc!(y::Vector{T}, oa::Int, ob::Int, Lpp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -4040,8 +4069,8 @@ end
 # Explicit vectors, running to a full vector past n (the pads of both planes are zero):
 # eight accumulators, one real and one imaginary per column.
 @inline function _lhl_pdot4(y::Vector{T}, Gt::Matrix{T}, o::Int, j::Int, jn::Int, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     ldg = size(Gt, 1)
     GC.@preserve y Gt begin
@@ -4095,8 +4124,8 @@ end
 _hessenberg_solve_buf!(y::AbstractVector, sh::LHLShift) = _hessenberg_solve!(y, sh)
 
 function _hessenberg_solve_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     Gt = sh.Gt
     rd = sh.rdiag
@@ -4236,8 +4265,8 @@ _hessenberg_solveH_buf!(y::AbstractVector, sh::LHLShift) = _hessenberg_solveH!(y
 # On the padded buffer: the four-column axpy runs whole vectors past n (`Gt`'s pad rows
 # and `y`'s pad are zero, so the overrun writes back zeros).
 function _hessenberg_solveH_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     Gt = sh.Gt
     rd = sh.rdiag
@@ -4379,8 +4408,8 @@ end
         y::Vector{T}, Gt::Matrix{T}, o::Int, i::Int, n::Int,
         z1::Complex{T}, z2::Complex{T}, z3::Complex{T}, z4::Complex{T}
     ) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    V = _lhl_svectype(T)
+    W = _LHL_SVEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     ldg = size(Gt, 1)
     GC.@preserve y Gt begin
@@ -4681,9 +4710,10 @@ not modified; [`lhl!`](@ref) reuses an existing workspace instead of allocating 
 `shift` is the element type of the shifts and solves; `Complex{eltype(J)}` on a real `J`
 keeps the reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
-`thread = Val(true)` lets the blocked reduction (on x86-64 `n ≥ 500` for `Float64`, `512`
-for `ComplexF64`, `1024` for `Float32` and `ComplexF32`; on aarch64 `500` / `768` / `576` /
-`1152`; other element types stay serial) run on Polyester threads; threading requires
+`thread = Val(true)` lets the blocked reduction (on AVX2 x86-64 `n ≥ 500` for `Float64`,
+`512` for `ComplexF64`, `1024` for `Float32` and `ComplexF32`; on AVX-512 `1280` / `1152` /
+`1920` / `1664`; on aarch64 `500` / `768` / `576` / `1152`; other element types stay serial)
+run on Polyester threads; threading requires
 `using Polyester` (which loads the `LHLFactorizationPolyesterExt` extension) and
 `julia -t N` — without either, `Val(true)` silently runs the serial code.  `Val(false)`
 (or `false`) keeps it single-threaded.  The threaded work is partitioned independently of

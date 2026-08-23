@@ -85,9 +85,10 @@ xc = lhl_ldiv!(ComplexF64.(b), sh, wr)
 
 ## Threading
 
-The blocked reduction (on x86-64 `n ≥ 500` for `Float64`, `n ≥ 512` for `ComplexF64`,
-`n ≥ 1024` for `Float32` and `ComplexF32`; on aarch64 `n ≥ 500` / `768` / `576` / `1152`;
-other element types stay serial) runs on [Polyester](https://github.com/JuliaSIMD/Polyester.jl) threads
+The blocked reduction (on AVX2 x86-64 `n ≥ 500` for `Float64`, `n ≥ 512` for `ComplexF64`,
+`n ≥ 1024` for `Float32` and `ComplexF32`; on AVX-512 `n ≥ 1280` / `1152` / `1920` / `1664`;
+on aarch64 `n ≥ 500` / `768` / `576` / `1152`; other element types stay serial) runs on
+[Polyester](https://github.com/JuliaSIMD/Polyester.jl) threads
 when `thread = Val(true)` — the default — *and* Polyester is loaded. Polyester is a weak
 dependency: `using Polyester` loads the `LHLFactorizationPolyesterExt` extension, and
 without it (or without `julia -t N`) `Val(true)` silently runs the serial code. `Val(false)`
