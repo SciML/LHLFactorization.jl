@@ -137,6 +137,16 @@ end
     end
 end
 
+@testset "lane sum of the explicit-vector kernels" begin
+    # pairwise tree over any lane count (the kernels use 2/4/8/16; odd lengths must not index
+    # past the end), exact for small integers
+    LHL = LHLFactorization
+    for L in 1:17, T in (Float64, Float32)
+        v = ntuple(i -> VecElement(T(i)), L)
+        @test LHL._lhl_vsum(v) == T(L * (L + 1) ÷ 2)
+    end
+end
+
 @testset "explicit adjoint sweeps agree across vector widths: $T" for T in (Float64, Float32)
     # The descending adjoint sweep pipelines each group's dot around the previous head and
     # folds the four rows that head produces in from registers; how many vectors those rows
