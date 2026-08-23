@@ -83,7 +83,7 @@ end
 end
 
 @testset "applyZH!/applyZinvH! against the dense Z: $T" for T in (Float64, Float32, ComplexF64)
-    # 725 puts the Float64 packed multipliers above the 2 MiB tiling limit
+    # 725 puts the Float64 packed multipliers above the x86-64 tiling limit (aarch64 always tiles)
     for n in (1, 2, 3, 5, 40, 129, 256, 600, 725)
         J = randn(MersenneTwister(n), T, n, n)
         ws = lhl(J)
@@ -167,7 +167,7 @@ end
 end
 
 @testset "explicit-vector solve kernels agree with the generic ones" begin
-    # 725 (Float64) and 1030 (both) put the packed multipliers above the 2 MiB tiling limit
+    # 725 (Float64) and 1030 (both) put the packed multipliers above the x86-64 tiling limit
     for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
         J = randn(MersenneTwister(n), T, n, n)
         b = randn(MersenneTwister(n + 7), T, n)
@@ -682,8 +682,8 @@ end
         H = triu(ws.factors, -1)
         @test Z * H * Zi ≈ J rtol = (Tr === Float32 ? 2.0e-3 : 1.0e-8)
     end
-    # solves across the unblocked/blocked and sweep-tiling thresholds vs `\`; 530 and 1040
-    # take the ComplexF64 blocked path, 1040 also the untiled planar sweeps
+    # solves across the unblocked/blocked and sweep-tiling thresholds vs `\`; 530 (x86-64)
+    # and 1040 take the ComplexF64 blocked path, 1040 also the x86-64 untiled planar sweeps
     for n in (2, 3, 5, 16, 40, 129, 260, 530, 1040), balance in (true, false)
         Tr === Float32 && n > 530 && continue   # κ·eps already caps Float32 accuracy
         J = T.(randn(MersenneTwister(n), ComplexF64, n, n))
@@ -732,8 +732,8 @@ end
 end
 
 @testset "complex allocation-free paths" begin
-    # 530 crosses the ComplexF64 blocked threshold, 1040 the sweep-tiling limit
-    for T in (ComplexF64, ComplexF32), m in (64, 530)
+    # the second size crosses the blocked threshold (530 for ComplexF64 on x86-64)
+    for T in (ComplexF64, ComplexF32), m in (64, max(530, LHLFactorization._lhl_block_min(T) + 18))
         Jm = randn(MersenneTwister(m), T, m, m) + 3m * I
         ws = lhl(Jm; thread = Val(false))
         sh = LHLShift{T}(ws)

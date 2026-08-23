@@ -104,7 +104,8 @@ LU's triangular solves do (0.5× at `n ≤ 64`, 0.8× at `n = 256`, 1.0–1.25×
 `n = 512–2000`), so the trade pays whenever a factorization serves more than a handful of
 shifts.
 
-The reduction is unblocked below `n ≈ 500` (Float64; 1000 for Float32) and blocked above:
+The reduction is unblocked below `n ≈ 500` (Float64; 1000 for Float32 on x86-64, 576 on
+aarch64, where the crossovers were re-measured on an Apple M2 Max) and blocked above:
 delayed panel updates with rank-`nb` GEMMs in a register-blocked pure-Julia microkernel, no
 BLAS. On one thread it runs at 1× a LAPACK LU for `n ≤ 64`, 2.7× at `n = 256`, 3.8× at
 `n = 1024` and 5–6× at `n = 1600–2000`, where the trailing GEMV that dominates it is DRAM-bound.
