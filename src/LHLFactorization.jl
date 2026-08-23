@@ -60,6 +60,10 @@ export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lh
 # The complex element types with explicit-vector kernels (planar shift state, interleaved
 # real-view reduction kernels, planar solve sweeps).
 const _LHL_CFloat = Union{ComplexF32, ComplexF64}
+# Hardware-flavoured constants below (`_lhl_block_min`, `_lhl_tiled`, `_lhl_shift_fused_min`)
+# were measured on AVX2 (AMD EPYC 7502) and on 16-byte NEON (Apple M2 Max); non-x86
+# targets take the NEON values.
+const _LHL_X86 = Sys.ARCH === :x86_64
 
 """
     LHLShift{TG}(n)
@@ -210,14 +214,16 @@ _lhl_tilew(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _LHL_VEC_BYTES 
 # four, k = 4g-3, g = 1:(n-2)÷4: eight head slots holding the 3×3 triangle rows k+2:k+4 in
 # the order l[k+2,k]; l[k+3,k], l[k+3,k+1]; l[k+4,k], l[k+4,k+1], l[k+4,k+2]; then the body,
 # rows k+5:n of the four columns zero padded to mp = cld(n-k-4, W)·W rows.  For the
-# explicit kernels below 2 MiB (`_lhl_tiled`) the body is tiled — W rows of column 0, W
-# rows of column 1, ... — so a rank-4 sweep reads one stream; otherwise it is four plain
-# columns, which the hardware prefetcher streams from L3/DRAM faster than one stream four
-# times as fast, and which the generic sweeps vectorize as long loops.  The remaining
-# steps 4G+1:n-2 follow one at a time as plain zero-padded columns.
+# explicit kernels the body is tiled (`_lhl_tiled`) — W rows of column 0, W rows of
+# column 1, ... — so a rank-4 sweep reads one stream; otherwise it is four plain columns,
+# which the generic sweeps vectorize as long loops.  On x86-64 the tiles stop at 4 MiB of
+# multipliers: past the L3 the hardware prefetcher streams four columns faster than one
+# stream four times as fast (EPYC 7502, 10–25 % slower tiled).  On Apple M2 Max one stream
+# stays 2–20 % faster up to the largest size measured (120 MiB), so aarch64 always tiles.
+# The remaining steps 4G+1:n-2 follow one at a time as plain zero-padded columns.
 const _LHL_HEAD = 8
 _lhl_tiled(n::Int, ::Type{T}) where {T} =
-    T <: Union{Float32, Float64} && n * n * sizeof(T) <= 4 * 2^20
+    T <: Union{Float32, Float64} && (!_LHL_X86 || n * n * sizeof(T) <= 4 * 2^20)
 _lhl_group_size(n::Int, k::Int, W::Int) = _LHL_HEAD + 4 * cld(n - k - 4, W) * W
 _lhl_single_size(n::Int, k::Int, W::Int) = cld(n - k - 1, W) * W
 function _lhl_lpack_len(n::Int, W::Int)
@@ -232,9 +238,12 @@ function _lhl_lpack_len(n::Int, W::Int)
     return len
 end
 
-# Leading dimension of `fstore`: columns 32-byte aligned, and no multiple m ≤ 8 of the
-# column stride within 128 bytes of a multiple of 4 KiB.  Below n = 64 the aliasing costs
-# nothing measurable.
+# Leading dimension of `fstore`: columns 32-byte aligned, and no multiple m ≤ 16 of the
+# column stride within 128 bytes of a multiple of 4 KiB (store→load aliasing between the
+# columns a row block sweeps; m ≤ 8 covered the EPYC 7502, Apple M2 Max still dips 7–20 %
+# at n ≡ 32 (mod 64) until m ≤ 16 — the wider range pads a few more n by ≤ 16 columns and
+# never more than the m ≤ 8 rule's worst case).  Below n = 64 the aliasing costs nothing
+# measurable.
 function _lhl_ld(n::Int, ::Type{T}) where {T}
     n <= 64 && return n
     sz = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Cvoid})
@@ -244,7 +253,7 @@ function _lhl_ld(n::Int, ::Type{T}) where {T}
     while !ok
         ld += W
         ok = true
-        for m in 1:8
+        for m in 1:16
             r = (m * ld * sz) % 4096
             ok &= min(r, 4096 - r) >= 128
         end
@@ -938,13 +947,16 @@ end
 # Below `_lhl_block_min` the panel bookkeeping costs more than the GEMM saves; a narrow
 # panel wins because the trailing GEMV that dominates is independent of `nb` while the
 # per-step panel work grows with it.  With the row-block trailing update on the padded
-# `fstore` the unblocked reduction stays ahead up to n ≈ 500 (Float64) / 1000 (Float32);
-# with the explicit complex kernels the measured crossovers sit at n ≈ 500 (ComplexF64)
-# and 1024–1400 (ComplexF32), matching the real types of the same element size.
+# `fstore` the unblocked reduction stays ahead up to n ≈ 500 (Float64) / 1000 (Float32) on
+# AVX2 (EPYC 7502); with the explicit complex kernels the measured crossovers sit at
+# n ≈ 500 (ComplexF64) and 1024–1400 (ComplexF32) there.  On 16-byte NEON (Apple M2 Max,
+# kernels at two registers per vector) the crossovers measure ≈ 500 / 576 / 768 / 1152 —
+# the row-block sweep is relatively weaker for Float32, stronger for complex.  Other
+# non-x86 targets are unmeasured and take the NEON values.
 _lhl_block_min(::Type{Float64}) = 500
-_lhl_block_min(::Type{Float32}) = 1024
-_lhl_block_min(::Type{ComplexF64}) = 512
-_lhl_block_min(::Type{ComplexF32}) = 1024
+_lhl_block_min(::Type{Float32}) = _LHL_X86 ? 1024 : 576
+_lhl_block_min(::Type{ComplexF64}) = _LHL_X86 ? 512 : 768
+_lhl_block_min(::Type{ComplexF32}) = _LHL_X86 ? 1024 : 1152
 _lhl_block_min(::Type{T}) where {T} = 768
 _lhl_panel_width(n::Int) = 16
 
@@ -2123,7 +2135,13 @@ end
 # K loop; P (the multiplier panel) is packed with the sign folded in so the tile streams it
 # with unit stride and no leading-dimension aliasing.
 # ---------------------------------------------------------------------------
-const _LHL_VEC_BYTES = Sys.ARCH === :x86_64 ? 32 : 16
+# Bytes per kernel vector: the width the explicit-vector kernels (GEMM microkernel, row-block
+# trailing update, `Lp` tiles and solve sweeps) are written for.  32 is one AVX2 register;
+# on 16-byte NEON LLVM legalizes it to two registers per vector, which with 32 vector
+# registers doubles every tile for free (Apple M2 Max: reduction 5–17 % faster at n ≤ 192
+# and 3–6 % above, solves 7–17 % faster at n ≤ 128 than with 16; 64 was 20–47 % slower).
+# Not measured on AVX-512, where 64 would be the natural value.
+const _LHL_VEC_BYTES = 32
 
 for (T, sfx) in ((Float64, "f64"), (Float32, "f32")), W in (2, 4, 8, 16)
     V = NTuple{W, VecElement{T}}
@@ -3221,9 +3239,10 @@ end
 # The adjoint sweeps on the padded buffer: full vectors past `n` (both pads zero), one
 # plane at a time.  The planar complex path runs each plane through these — the
 # multipliers are real, so no conjugation and no cross-plane terms.
-function _lhl_zsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
+_lhl_zsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}} =
+    _lhl_zsweepH_buf!(Val(_lhl_tilew(T)), y, o, Lp, n)
+function _lhl_zsweepH_buf!(::Val{W}, y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {W, T <: Union{Float32, Float64}}
+    V = NTuple{W, VecElement{T}}
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -3274,17 +3293,20 @@ end
     return x1, x2, x3, x4
 end
 
-# One column's slice of a pipelined dot's first vector: rows k+1:k+4 from the registers
-# the head just produced, rows k+5:k+W (W = 8 only) from memory.
-@inline function _lhl_zfoldH(pc::Ptr{T}, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}, W::Int) where {T}
-    s = muladd(
-        unsafe_load(pc), x1, muladd(
-            unsafe_load(pc, 2), x2,
-            muladd(unsafe_load(pc, 3), x3, unsafe_load(pc, 4) * x4)
-        )
-    )
-    for r in 5:W
-        s = muladd(unsafe_load(pc, r), unsafe_load(py4, r - 4), s)
+# One column's slice of the rows a pipelined dot left out: its first `NV` vectors
+# (`NV = max(1, 4 ÷ W)`, so 4 rows for W ≤ 4 and W rows above), rows k+1:k+4 from the
+# registers the head just produced, the rest (W = 8, 16) from memory.  Row r of the slice
+# sits at `pc + (r - 1) ÷ W · pa + (r - 1) % W` elements — consecutive for one vector, `pa`
+# apart across vectors.
+@inline function _lhl_zfoldH(
+        ::Val{W}, pc::Ptr{T}, pa::Int, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}
+    ) where {W, T}
+    NV = max(1, 4 ÷ W)
+    s = zero(T)
+    for r in 1:(NV * W)
+        c = unsafe_load(pc + ((r - 1) ÷ W) * pa, (r - 1) % W + 1)
+        x = r == 1 ? x1 : r == 2 ? x2 : r == 3 ? x3 : r == 4 ? x4 : unsafe_load(py4, r - 4)
+        s = muladd(c, x, s)
     end
     return s
 end
@@ -3292,25 +3314,15 @@ end
 # The descending sweep is a back substitution: each group's dots read the four rows the
 # previous head wrote, so the groups chain.  Pipelined like `_hessenberg_solve_buf!`: the
 # next group's dots over the rows no pending head touches (its body minus its first
-# vector) are issued before the current head's scalar chain, and the first vector is
-# folded in afterwards from registers.
-function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    if W < 4
-        # This descending back substitution is pipelined: the next group's body dots are
-        # issued before the current group's head is resolved, and the four rows that head
-        # writes (the intra-group coupling) are folded back in from registers afterwards
-        # (`_lhl_zfoldH`).  That fold treats the four coupling rows as the first SIMD
-        # vector, so it is only correct when a vector spans at least them — `W ≥ 4`.  On a
-        # 128-bit ISA `W = 2` for `Float64`, so those four rows straddle two vectors: the
-        # second is already summed into the body dots and the fold would count it again.
-        # The generic sweep is width agnostic, so defer to it there.  (`Float32` keeps
-        # `W = 4` even at 128 bits, and every 256-bit target has `W ≥ 4`, so the fast path
-        # below still runs for them.)
-        _lhl_zinvsweepH!(view(y, (o + 1):length(y)), Lp, n)
-        return y
-    end
+# `NV` vectors, the ones holding rows k+1:k+4) are issued before the current head's scalar
+# chain, and those vectors are folded in afterwards from registers (`_lhl_zfoldH`).
+# `W` is the vector width `Lp` was packed with (`_lhl_tilew(T)` in the workspace); the
+# `Val` form exists so that the tests can run every width on any machine.
+_lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}} =
+    _lhl_zinvsweepH_buf!(Val(_lhl_tilew(T)), y, o, Lp, n)
+function _lhl_zinvsweepH_buf!(::Val{W}, y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {W, T <: Union{Float32, Float64}}
+    V = NTuple{W, VecElement{T}}
+    NV = max(1, 4 ÷ W)
     sz = sizeof(T)
     tiled = _lhl_tiled(n, T)
     G = max(n - 2, 0) >> 2
@@ -3341,14 +3353,14 @@ function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where
             csn = tiled ? W * sz : mpbn
             pan = tiled ? 4W * sz : W * sz
             e1, e2, e3, e4 = _lhl_zbodyH(
-                V, pf + pan, tiled ? pf + 4mpbn : pf + mpbn, pan, csn, py + (k + 4 + W) * sz
+                V, pf + NV * pan, tiled ? pf + 4mpbn : pf + mpbn, pan, csn, py + (k + 4 + NV * W) * sz
             )
             x1, x2, x3, x4 = _lhl_zinvheadH(y, o, k + 4, h, d1, d2, d3, d4)
             py4 = py + (k + 8) * sz
-            d1 = e1 + _lhl_zfoldH(pf, x1, x2, x3, x4, py4, W)
-            d2 = e2 + _lhl_zfoldH(pf + csn, x1, x2, x3, x4, py4, W)
-            d3 = e3 + _lhl_zfoldH(pf + 2csn, x1, x2, x3, x4, py4, W)
-            d4 = e4 + _lhl_zfoldH(pf + 3csn, x1, x2, x3, x4, py4, W)
+            d1 = e1 + _lhl_zfoldH(Val(W), pf, pan, x1, x2, x3, x4, py4)
+            d2 = e2 + _lhl_zfoldH(Val(W), pf + csn, pan, x1, x2, x3, x4, py4)
+            d3 = e3 + _lhl_zfoldH(Val(W), pf + 2csn, pan, x1, x2, x3, x4, py4)
+            d4 = e4 + _lhl_zfoldH(Val(W), pf + 3csn, pan, x1, x2, x3, x4, py4)
             h = hn
             g -= 1
         end
@@ -3593,8 +3605,10 @@ end
 
 # Below these sizes the one-step passes win: their inner loops are shorter and the fused
 # passes' triangles cost more per step; a complex shift, whose passes store twice as much,
-# gains from fusing earlier.
-_lhl_shift_fused_min(::Type{TG}) where {TG} = TG <: Complex ? 128 : 512
+# gains from fusing earlier (from n ≈ 128 on the EPYC 7502; on the Apple M2 Max the
+# one-step complex passes hold on to n ≈ 220 (ComplexF64) / 300 (ComplexF32), fusing at
+# 128 there costs 4–28 % in 128–192).  The real crossover measures 512 on both.
+_lhl_shift_fused_min(::Type{TG}) where {TG} = TG <: Complex ? (_LHL_X86 ? 128 : 256) : 512
 
 # Element access on the shift's storage: for a complex `TG` the value at (row j[, column c])
 # is the pair at rows j and o+j of the two planes.
@@ -4644,9 +4658,9 @@ not modified; [`lhl!`](@ref) reuses an existing workspace instead of allocating 
 `shift` is the element type of the shifts and solves; `Complex{eltype(J)}` on a real `J`
 keeps the reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
-`thread = Val(true)` lets the blocked reduction (`n ≥ 500` for `Float64`, `512` for
-`ComplexF64`, `1024` for `Float32` and `ComplexF32`; other element types stay serial) run
-on Polyester threads; threading requires
+`thread = Val(true)` lets the blocked reduction (on x86-64 `n ≥ 500` for `Float64`, `512`
+for `ComplexF64`, `1024` for `Float32` and `ComplexF32`; on aarch64 `500` / `768` / `576` /
+`1152`; other element types stay serial) run on Polyester threads; threading requires
 `using Polyester` (which loads the `LHLFactorizationPolyesterExt` extension) and
 `julia -t N` — without either, `Val(true)` silently runs the serial code.  `Val(false)`
 (or `false`) keeps it single-threaded.  The threaded work is partitioned independently of

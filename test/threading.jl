@@ -29,7 +29,10 @@ function threading_tests()
             lhl!(w2, J; balance, thread = Val(true))
             return w1, w2
         end
-        for (T, n) in ((Float64, 520), (Float64, 777), (Float32, 1030), (ComplexF64, 777), (ComplexF32, 1030)), balance in (true, false)
+        # sizes on the blocked path for every element type (the thresholds differ per
+        # architecture: `_lhl_block_min`)
+        bm(T, n) = max(n, LHL._lhl_block_min(T) + 6)
+        for (T, n) in ((Float64, 520), (Float64, 777), (Float32, bm(Float32, 1030)), (ComplexF64, bm(ComplexF64, 777)), (ComplexF32, bm(ComplexF32, 1030))), balance in (true, false)
             J = randn(MersenneTwister(n), T, n, n)
             w1, w2 = both(J, balance)
             @test w1.ipiv == w2.ipiv
