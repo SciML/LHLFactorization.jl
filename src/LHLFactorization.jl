@@ -86,6 +86,12 @@ const _LHL_AVX512 = Sys.ARCH === :x86_64 && Sys.CPU_NAME in _LHL_AVX512_CPUS
 const _LHL_RVEC_BYTES = _LHL_AVX512 ? 64 : 32
 const _LHL_SVEC_BYTES = 32
 
+# Zen 4/5 run the 64-byte kernels very differently from Intel AVX-512 silicon, which the
+# blocked/unblocked crossover is highly sensitive to; see `_lhl_block_min`.
+const _LHL_AVX512_ZEN = _LHL_AVX512 && Sys.CPU_NAME in ("znver4", "znver5")
+# Apple cores against the Neoverse line, the same split on the NEON side.
+const _LHL_APPLE = Sys.ARCH === :aarch64 && startswith(String(Sys.CPU_NAME), "apple")
+
 """
     LHLShift{TG}(n)
     LHLShift{TG}(ws::LHLWorkspace)
@@ -1000,10 +1006,41 @@ end
 # longer, to ≈ 1320 / 1900 / 1140 / 1700, and falls off steeply past that (it is then
 # out of L2), so the constants sit a little below.  Other non-x86 targets are unmeasured
 # and take the NEON values.
-_lhl_block_min(::Type{Float64}) = _LHL_AVX512 ? 1280 : 500
-_lhl_block_min(::Type{Float32}) = _LHL_AVX512 ? 1920 : _LHL_X86 ? 1024 : 576
-_lhl_block_min(::Type{ComplexF64}) = _LHL_AVX512 ? 1152 : _LHL_X86 ? 512 : 768
-_lhl_block_min(::Type{ComplexF32}) = _LHL_AVX512 ? 1664 : _LHL_X86 ? 1024 : 1152
+#
+# One pair of AVX-512 constants cannot serve every AVX-512 machine: an i7-1185G7 (Tiger
+# Lake) wants ≈ 570 / 900 / 850 / 1200 where the EPYC 9354 wants ≈ 1240 / 1780 / 1090 / 1540
+# (re-measured; the numbers above stand within 3–8 %, inside the run-to-run spread, so they
+# are kept).  The split is by **microarchitecture, not cache**, which the AVX2 path settles:
+# forced to AVX2, the EPYC 9354's Float64 crossover drops to ≈ 510, against ≈ 500 on the
+# 16 MiB EPYC 7502 and ≈ 445 on the 12 MiB Tiger Lake — flat across a 2.7× range of
+# last-level cache — while switching that same EPYC to the 64-byte kernels moves it 510 →
+# 1240, a factor of 2.4 on one machine at fixed cache.  The same switch on the Tiger Lake
+# part is only 445 → 570, a factor of 1.28.  So it is AVX-512 *on Zen 4* that keeps the
+# unblocked sweep ahead, plausibly because LLVM gives znver4 a 512-bit `prefer-vector-width`
+# and Intel parts a 256-bit one, so on Zen both the explicit kernels and the auto-vectorized
+# trailing GEMV widen while on Intel only the former does.  (Cache was the first hypothesis
+# and is dead: besides the flat AVX2 row, ComplexF64 on AVX2 crosses over *earlier* with
+# more cache — 620 at 12 MiB, 512 at 16, < 384 at 32 — and n²·sizeof(T) at the crossover
+# spans 0.12 to 0.92 of the cache across the machines measured.)
+#
+# The NEON side splits the same way: a Neoverse N1 measures ≈ 320 / 490 / < 256 / 370, so
+# the M2 Max constants were ~3× too high there — ComplexF64 at n = 640 ran 2.5× slower than
+# the blocked path it should have taken, ComplexF32 at n = 1024 2.7× slower.  With two ARM
+# cores and no way to separate core width from cache, the split is by vendor, Apple against
+# the Neoverse line; unknown ARM takes the Neoverse values, the safer side, since being too
+# high cost 2.5× on the N1 while being too low cost at most ≈ 1.4× anywhere measured.
+#
+# Untested and worth measuring if the hardware appears: Intel *server* AVX-512 (Skylake-SP,
+# Ice Lake-SP, Sapphire Rapids), which unlike the client parts here has two 512-bit FMA
+# ports and may behave like Zen 4 rather than like the Tiger Lake it is grouped with.
+_lhl_block_min(::Type{Float64}) = _LHL_AVX512 ? (_LHL_AVX512_ZEN ? 1280 : 543) :
+    _LHL_X86 ? 500 : _LHL_APPLE ? 500 : 288
+_lhl_block_min(::Type{Float32}) = _LHL_AVX512 ? (_LHL_AVX512_ZEN ? 1920 : 880) :
+    _LHL_X86 ? 1024 : _LHL_APPLE ? 576 : 448
+_lhl_block_min(::Type{ComplexF64}) = _LHL_AVX512 ? (_LHL_AVX512_ZEN ? 1152 : 832) :
+    _LHL_X86 ? 512 : _LHL_APPLE ? 768 : 224
+_lhl_block_min(::Type{ComplexF32}) = _LHL_AVX512 ? (_LHL_AVX512_ZEN ? 1664 : 1152) :
+    _LHL_X86 ? 1024 : _LHL_APPLE ? 1152 : 336
 _lhl_block_min(::Type{T}) where {T} = 768
 _lhl_panel_width(n::Int) = 16
 
