@@ -2215,9 +2215,10 @@ end
 
 # ---------------------------------------------------------------------------
 # Register-blocked GEMM microkernel (Base only): NTuple{W,VecElement} + llvm.fmuladd, after
-# LinearSolve.jl's blocked_lufact.jl.  Holds a 3W×4 tile of C in registers over the whole
-# K loop; P (the multiplier panel) is packed with the sign folded in so the tile streams it
-# with unit stride and no leading-dimension aliasing.
+# LinearSolve.jl's blocked_lufact.jl.  Holds a 3W×`_LHL_NR` tile of C in registers over the
+# whole K loop — nr = 8 where there are 32 vector registers, 4 where there are 16; P (the
+# multiplier panel) is packed with the sign folded in so the tile streams it with unit
+# stride and no leading-dimension aliasing.
 # ---------------------------------------------------------------------------
 for (T, sfx) in ((Float64, "f64"), (Float32, "f32")), W in (2, 4, 8, 16)
     V = NTuple{W, VecElement{T}}
@@ -2277,56 +2278,90 @@ end
     return nothing
 end
 
-# Whole 3W×4 tiles of C[ib:ie, c0:c1] += P * B; returns the first column no tile covered.
+# Columns per register tile.  A 3W×nr tile keeps 3·nr accumulators live across the K loop,
+# plus the three P vectors and the broadcast: nr = 4 is 16 registers, all of AVX2's; nr = 8
+# is 28 of AVX-512's 32.  Widening pays twice — the tile's operand traffic per flop is
+# (3W + nr)/(2·3W·nr), so 4 → 8 nearly halves it, and the C load/store around the K loop
+# amortizes over twice the columns.  Measured on a znver5 at the reduction's own shapes
+# (trailing blocks 256–2048, nb = 16): 1.07–1.17× Float64, 1.00–1.13× Float32,
+# 1.39–1.50× ComplexF64, 1.23–1.31× ComplexF32.  The complex types gain most because their
+# expanded real problem runs K' = 2·nb — twice the real path's inner length, so twice the
+# loop to amortize the prologue against.  nr = 10 needs 34 registers and measured 10–20 %
+# *below* nr = 8, which is what pins the reading to register pressure; hence nr stays 4
+# wherever there are only 16 vector registers.
+const _LHL_NR = _LHL_AVX512 ? 8 : 4
+
+# Whole 3W×NR tiles of C[ib:ie, c0:c1] += P * B; returns the first column no tile covered.
+# Generated per width: the accumulators have to be plain locals for LLVM to hold them in
+# registers across the K loop, so the tile is unrolled rather than carried in a tuple.
+for NR in (4, 8)
+    fn = Symbol("_lhl_micro_tile", NR, "!")
+    t = [[Symbol("t_", r, "_", j) for r in 1:3] for j in 1:NR]
+    q = [Symbol("q_", j) for j in 1:NR]
+    qdef = [:($(q[j]) = $(q[1]) + $(j - 1) * ldcs) for j in 2:NR]
+    tload = vcat(
+        ([:($(t[j][r]) = _lhl_vload(V, $(q[j]) + $(r - 1) * vb)) for r in 1:3] for j in 1:NR)...
+    )
+    tstore = vcat(
+        ([:(_lhl_vstore!($(q[j]) + $(r - 1) * vb, $(t[j][r]))) for r in 1:3] for j in 1:NR)...
+    )
+    inner = vcat(
+        (
+            [
+                    :(b = _lhl_bcast(V, unsafe_load(pb + $(j - 1) * ldbs))),
+                    [:($(t[j][r]) = _lhl_fma($(Symbol("p", r)), b, $(t[j][r]))) for r in 1:3]...,
+                ] for j in 1:NR
+        )...
+    )
+    @eval @inline function $fn(
+            ::Type{V}, pC::Ptr{T}, ldc::Int, pP::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
+            K::Int, ibase::Int, ib::Int, ie::Int, c0::Int, c1::Int
+        ) where {W, T, V <: NTuple{W, VecElement{T}}}
+        sz = sizeof(T)
+        ldcs = ldc * sz
+        ldps = ldp * sz
+        ldbs = ldb * sz
+        vb = W * sz
+        c = c0
+        while c + $(NR - 1) <= c1
+            pcol = pC + (c - 1) * ldcs
+            pb0 = pB + (c - 1) * ldbs
+            i = ib
+            while i + 3W - 1 <= ie
+                $(q[1]) = pcol + (i - 1) * sz
+                $(qdef...)
+                $(tload...)
+                pk = pP + (i - ibase) * sz
+                pb = pb0
+                for _ in 1:K
+                    p1 = _lhl_vload(V, pk)
+                    p2 = _lhl_vload(V, pk + vb)
+                    p3 = _lhl_vload(V, pk + 2vb)
+                    $(inner...)
+                    pk += ldps
+                    pb += sz
+                end
+                $(tstore...)
+                i += 3W
+            end
+            c += $NR
+        end
+        return c
+    end
+end
+
+# The widest tiles first, then 4-wide for what is left over.  Every C element takes its K
+# FMAs in the same order whichever tile covers it, so widening `_LHL_NR` does not change a
+# single result — the reduction stays bit-identical, threaded or not.
 @inline function _lhl_micro_tile!(
         ::Type{V}, pC::Ptr{T}, ldc::Int, pP::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
         K::Int, ibase::Int, ib::Int, ie::Int, c0::Int, c1::Int
     ) where {W, T, V <: NTuple{W, VecElement{T}}}
-    sz = sizeof(T)
-    ldcs = ldc * sz
-    ldps = ldp * sz
-    ldbs = ldb * sz
-    vb = W * sz
     c = c0
-    while c + 3 <= c1
-        pcol = pC + (c - 1) * ldcs
-        pb0 = pB + (c - 1) * ldbs
-        i = ib
-        while i + 3W - 1 <= ie
-            q1 = pcol + (i - 1) * sz
-            q2 = q1 + ldcs
-            q3 = q2 + ldcs
-            q4 = q3 + ldcs
-            t11 = _lhl_vload(V, q1); t21 = _lhl_vload(V, q1 + vb); t31 = _lhl_vload(V, q1 + 2vb)
-            t12 = _lhl_vload(V, q2); t22 = _lhl_vload(V, q2 + vb); t32 = _lhl_vload(V, q2 + 2vb)
-            t13 = _lhl_vload(V, q3); t23 = _lhl_vload(V, q3 + vb); t33 = _lhl_vload(V, q3 + 2vb)
-            t14 = _lhl_vload(V, q4); t24 = _lhl_vload(V, q4 + vb); t34 = _lhl_vload(V, q4 + 2vb)
-            pk = pP + (i - ibase) * sz
-            pb = pb0
-            for _ in 1:K
-                p1 = _lhl_vload(V, pk)
-                p2 = _lhl_vload(V, pk + vb)
-                p3 = _lhl_vload(V, pk + 2vb)
-                b = _lhl_bcast(V, unsafe_load(pb))
-                t11 = _lhl_fma(p1, b, t11); t21 = _lhl_fma(p2, b, t21); t31 = _lhl_fma(p3, b, t31)
-                b = _lhl_bcast(V, unsafe_load(pb + ldbs))
-                t12 = _lhl_fma(p1, b, t12); t22 = _lhl_fma(p2, b, t22); t32 = _lhl_fma(p3, b, t32)
-                b = _lhl_bcast(V, unsafe_load(pb + 2ldbs))
-                t13 = _lhl_fma(p1, b, t13); t23 = _lhl_fma(p2, b, t23); t33 = _lhl_fma(p3, b, t33)
-                b = _lhl_bcast(V, unsafe_load(pb + 3ldbs))
-                t14 = _lhl_fma(p1, b, t14); t24 = _lhl_fma(p2, b, t24); t34 = _lhl_fma(p3, b, t34)
-                pk += ldps
-                pb += sz
-            end
-            _lhl_vstore!(q1, t11); _lhl_vstore!(q1 + vb, t21); _lhl_vstore!(q1 + 2vb, t31)
-            _lhl_vstore!(q2, t12); _lhl_vstore!(q2 + vb, t22); _lhl_vstore!(q2 + 2vb, t32)
-            _lhl_vstore!(q3, t13); _lhl_vstore!(q3 + vb, t23); _lhl_vstore!(q3 + 2vb, t33)
-            _lhl_vstore!(q4, t14); _lhl_vstore!(q4 + vb, t24); _lhl_vstore!(q4 + 2vb, t34)
-            i += 3W
-        end
-        c += 4
+    if _LHL_NR == 8
+        c = _lhl_micro_tile8!(V, pC, ldc, pP, ldp, pB, ldb, K, ibase, ib, ie, c, c1)
     end
-    return c
+    return _lhl_micro_tile4!(V, pC, ldc, pP, ldp, pB, ldb, K, ibase, ib, ie, c, c1)
 end
 
 # One W×4 tile of C[ib:ib+W-1, c0:c1] += P * B (the last < 3W rows of a block, four
