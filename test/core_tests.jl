@@ -787,3 +787,25 @@ end
         @test @allocated(lhl!(ws, Jm; thread = Val(false))) == 0
     end
 end
+
+# The sizes in "reduction reconstructs J" are fixed, so on a machine whose `_lhl_block_min`
+# is above them (any Zen 4: 1280 for Float64, 1920 for Float32) the real-type blocked path
+# is never entered by that testset — the complex ones are covered, at line ~763, because
+# they size themselves off `_lhl_block_min`.  Cover the real types the same way.
+@testset "blocked and unblocked reduction agree, whatever this machine's crossover" begin
+    for T in (Float64, Float32)
+        nb = LHLFactorization._lhl_block_min(T)
+        @test nb < 4096                          # a typo here would make the test vacuous
+        for (n, path) in ((64, :unblocked), (nb + 8, :blocked))
+            J = randn(MersenneTwister(n), T, n, n) + T(sqrt(n)) * Matrix{T}(I, n, n)
+            ws = lhl(J; thread = Val(false))
+            b = randn(MersenneTwister(7), T, n)
+            γ = T(0.01)
+            lhl_shift!(ws, one(T), -γ)
+            x = lhl_ldiv!(copy(b), ws)
+            W = I - γ * J
+            @test bwd(W, x, b) < max(800, 2n) * eps(T)
+            @test all(abs.(tril(ws.factors, -2)) .<= 1)   # pivoting held on this path
+        end
+    end
+end
