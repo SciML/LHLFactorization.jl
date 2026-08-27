@@ -2,12 +2,6 @@
 
 ## Unreleased
 
-### Breaking
-
-  - Removed `lhl_prefers_sparse`. Sparse solver selection belongs to the consuming solver
-    stack; LHLFactorization's per-block cost model still selects between LHL and sparse LU
-    kernels during factorization.
-
 ### Added
 
   - **Sparse `J`** (extension, loaded with `SparseArrays` and
