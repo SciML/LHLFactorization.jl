@@ -38,7 +38,7 @@ factorization is solved by channels.  See the keyword arguments of [`lhl`](@ref)
 module LHLFactorizationSparseExt
 
 using LHLFactorization: LHLFactorization, LHLWorkspace, LHLShift, lhl_reduce!, lhl_shift!, lhl_ldiv!
-import LHLFactorization: lhl, lhl!, lhl_shift!, lhl_ldiv!, lhl_refine!, lhl_isreduced, lhl_prefers_sparse
+import LHLFactorization: lhl, lhl!, lhl_shift!, lhl_ldiv!, lhl_refine!, lhl_isreduced
 using LinearAlgebra: LinearAlgebra, checksquare, mul!, ldiv!
 using SparseArrays: SparseArrays, SparseMatrixCSC, nnz
 using PureKLU: PureKLU
@@ -82,20 +82,6 @@ lhl_ldiv!(X::AbstractMatrix, F::SparseLHLFactorization) = slhl_ldiv!(X, F)
 lhl_refine!(x::AbstractVector, A, b::AbstractVector, F::SparseLHLFactorization, steps::Int) =
     slhl_refine!(x, A, b, F, steps)
 
-# consumer hooks (LinearSolve.jl): whether a reduction is loaded, and the structural gate for
-# choosing the sparse LHL solver over a sparse LU on this `J`.
 lhl_isreduced(F::SparseLHLFactorization) = F.epoch[] > 0
-
-function lhl_prefers_sparse(J::SparseMatrixCSC; lhl_max::Int = 4096)
-    n = checksquare(J)
-    n == 0 && return false
-    _, R = scc_order(n, J.colptr, J.rowval)
-    nblocks = length(R) - 1
-    maxb = 0
-    @inbounds for k in 1:nblocks
-        maxb = max(maxb, R[k + 1] - R[k])
-    end
-    return nblocks > 1 && maxb <= lhl_max
-end
 
 end # module

@@ -55,7 +55,7 @@ using LinearAlgebra: checksquare, mul!
 
 export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
     lhl_ldivH!, lhl_refineH!, applyZ!, applyZinv!, applyZH!, applyZinvH!,
-    lhl_isreduced, lhl_prefers_sparse
+    lhl_isreduced
 
 # The complex element types with explicit-vector kernels (planar shift state, interleaved
 # real-view reduction kernels, planar solve sweeps).
@@ -4822,21 +4822,6 @@ caches a reduction across shifts — LinearSolve.jl's `LHLFactorization` — ask
 whether it must re-reduce.
 """
 lhl_isreduced(ws::LHLWorkspace) = ws.reduced
-
-"""
-    lhl_prefers_sparse(J::SparseMatrixCSC; lhl_max = 4096) -> Bool
-
-A cheap, structure-only gate for choosing the sparse LHL solver over a sparse LU on `J`: it
-is worth reducing when `J` is *reducible* — its symmetric block triangular form has more than
-one block and its largest irreducible block is at most `lhl_max` — since that is the regime
-where the per-block reduction can beat a sparse LU (one big irreducible block is KLU's).  The
-per-block `kernel = :auto` cost model then makes the fine choice at factorization time.  A
-method is provided by the sparse extension; the fallback is `false`.
-
-LinearSolve.jl's `defaultalg` uses this to decide whether a sparse-`J` `WOperator` should
-default to `LHLFactorization`.
-"""
-lhl_prefers_sparse(::Any; kwargs...) = false
 
 # Compile the serial paths for both float types into the package image
 # (`ccall(:jl_generating_output)`: only while precompiling): the unblocked and the blocked

@@ -159,16 +159,10 @@ end
     end
 end
 
-@testset "consumer hooks: lhl_isreduced and lhl_prefers_sparse" begin
+@testset "consumer hook: lhl_isreduced" begin
     J = btf_matrix([1, 3, 5, 30, 4])       # reducible: several blocks
     F = lhl(J)
     @test lhl_isreduced(F)
-    @test lhl_prefers_sparse(J)
-    # one big irreducible block: KLU's regime, not preferred
-    Jbig = btf_matrix([200])
-    @test !lhl_prefers_sparse(Jbig)
-    @test lhl_prefers_sparse(Jbig; lhl_max = 500) == false   # still one block
-    @test lhl_prefers_sparse(sparse(2.0I, 5, 5))              # diagonal: five 1×1 blocks, reducible
 end
 
 @testset "Int32 indices and Float32" begin
