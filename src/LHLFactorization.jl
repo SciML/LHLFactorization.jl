@@ -2308,9 +2308,9 @@ for NR in (4, 8)
     inner = vcat(
         (
             [
-                    :(b = _lhl_bcast(V, unsafe_load(pb + $(j - 1) * ldbs))),
-                    [:($(t[j][r]) = _lhl_fma($(Symbol("p", r)), b, $(t[j][r]))) for r in 1:3]...,
-                ] for j in 1:NR
+                :(b = _lhl_bcast(V, unsafe_load(pb + $(j - 1) * ldbs))),
+                [:($(t[j][r]) = _lhl_fma($(Symbol("p", r)), b, $(t[j][r]))) for r in 1:3]...,
+            ] for j in 1:NR
         )...
     )
     @eval @inline function $fn(
