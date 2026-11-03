@@ -4830,7 +4830,7 @@ lhl_isreduced(ws::LHLWorkspace) = ws.reduced
 if ccall(:jl_generating_output, Cint, ()) == 1
     let
         for T in (Float64, Float32)
-            for n in (48, _lhl_block_min(T) + 8)
+            for n in (48,)
                 J = T[1 / (i + j) + (i == j) for i in 1:n, j in 1:n]
                 ws = lhl(J)
                 lhl!(ws, J; thread = Val(false))
